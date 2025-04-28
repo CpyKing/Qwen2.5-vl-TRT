@@ -3,6 +3,8 @@ import os
 import torch
 import torch.nn as nn
 
+import time
+
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import tensorrt as trt
@@ -15,37 +17,49 @@ from tensorrt_llm._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
                         supports_inflight_batching, torch_dtype_to_trt,
                         trt_dtype_to_torch)
 
-
+from flash_attn.layers.rotary import apply_rotary_emb
 from flash_attn import flash_attn_varlen_func
 
 
 def rotate_half(x):
-        """Rotates half the hidden dims of the input."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)   
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)   
     
 def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        orig_dtype = tensor.dtype
-        tensor = tensor.float()
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-        sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-        output = (tensor * cos) + (rotate_half(tensor) * sin)
-        output = output.to(orig_dtype)
-        return output
+    orig_dtype = tensor.dtype
+    tensor = tensor.float()
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    output = (tensor * cos) + (rotate_half(tensor) * sin)
+    output = output.to(orig_dtype)
+    return output
     
+def apply_rotary_pos_emb_flashatt(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.chunk(2, dim=-1)[0].contiguous()
+    sin = sin.chunk(2, dim=-1)[0].contiguous()
+    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
+    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
+    return q_embed, k_embed
     
 class MyFA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, len_q, len_k, max_q, max_k) -> torch.Tensor:
+    def forward(ctx, q, k, v, len_q, len_k) -> torch.Tensor:
         # ctx.save_for_backward(input)
-        return flash_attn_varlen_func(q, k, v, len_q, len_k, max_q, max_k)
+        # return flash_attn_varlen_func(q, k, v, len_q, len_k, 64, 64)
+        
+        return q + k
 
     @staticmethod
-    def symbolic(g: torch.Graph, q, k, v, len_q, len_k, max_q, max_k) -> torch.Value:
-        return g.op("MyFA", q, k, v, len_q, len_k, max_q, max_k)
+    def symbolic(g: torch.Graph, q, k, v, len_q, len_k) -> torch.Value:
+        return g.op("MyFA", q, k, v, len_q, len_k)
+    
+_myfa = MyFA.apply
 
 class MyModel(nn.Module):
     # def __init__(self, bias: bool = False):
@@ -61,17 +75,17 @@ class MyModel(nn.Module):
     #     return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
     
     def __init__(self, dim: int = 1280, num_heads: int = 16) -> None:
-            super().__init__()
-            self.num_heads = num_heads
-            self.head_dim = dim // num_heads
-            self.qkv = nn.Linear(dim, dim * 3, bias=True)
-            self.proj = nn.Linear(dim, dim)
-            
-            self.cu_seqlens = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/cu_seqlens.pt').to('cuda')
-            self.cu_window_seqlens = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/cu_window_seqlens.pt').to('cuda')
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        
+        self.cu_seqlens = torch.load('cu_seqlens.pt').to('cuda')
+        self.cu_window_seqlens = torch.load('cu_window_seqlens.pt').to('cuda')
             
     ## eager attn
-    def forward_0(self,
+    def forward(self,
                 hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
                 rotary_pos_emb: torch.Tensor = None) -> torch.Tensor:
@@ -95,7 +109,7 @@ class MyModel(nn.Module):
         attn_output = self.proj(attn_output)
         return attn_output
     ## flash attn
-    def forward(
+    def forward_0(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -108,21 +122,21 @@ class MyModel(nn.Module):
         cos = emb.cos()
         sin = emb.sin()
             
-        # q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
-        q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
-                                        rotary_pos_emb).squeeze(0)
-        k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
-                                        rotary_pos_emb).squeeze(0)
+        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+        # q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
+        #                                 rotary_pos_emb).squeeze(0)
+        # k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
+        #                                 rotary_pos_emb).squeeze(0)
         
         q = q.squeeze(0)
         k = k.squeeze(0)
 
-        # if attention_mask[0][0][-1] < 0:
-        #     # window atten
-        #     cu_seqlens = self.cu_window_seqlens
-        # else:
-        #     cu_seqlens = self.cu_seqlens
-        cu_seqlens = self.cu_window_seqlens
+        if attention_mask[0][0][-1] < 0:
+            # window atten
+            cu_seqlens = self.cu_window_seqlens
+        else:
+            cu_seqlens = self.cu_seqlens
+        # cu_seqlens = self.cu_window_seqlens
         
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         
@@ -130,23 +144,49 @@ class MyModel(nn.Module):
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
-        # attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-        #     seq_length, -1
-        # )
-        attn_output = MyFA.apply(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(seq_length, -1)
+        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+            seq_length, -1
+        )
+        
+        # attn_output = _myfa(q, k, v, cu_seqlens, cu_seqlens).reshape(seq_length, -1)
         attn_output = attn_output.to(dtype)
         
         attn_output = self.proj(attn_output)
         # attn_output = self.proj(hidden_states)
         return attn_output
-    
+
+
+class ModelWrapper(nn.Module):
+    def __init__(self, dim: int = 1280, num_heads: int = 16):
+        super().__init__()
+        self.layers = 15
+        self.model_seq = nn.Sequential(*[MyModel(dim, num_heads) for i in range(self.layers)])
+
+    def forward(self, hidden_states, full_attention_mask, rotary_pos_emb):
+        for i in range(self.layers):
+            hidden_states = self.model_seq[i](hidden_states, full_attention_mask, rotary_pos_emb)
+        return hidden_states
+    def forward_0(self, hidden_states, full_attention_mask, rotary_pos_emb):
+        for i in range(self.layers):
+            hidden_states = self.model_seq[i].forward_0(hidden_states, full_attention_mask, rotary_pos_emb)
+        return hidden_states
 
 def torch_forward(model: nn.Module, hidden_states, full_attention_mask, rotary_pos_emb):
-    return model(hidden_states, full_attention_mask, rotary_pos_emb)
+    for i in range(10):
+        stream = torch.cuda.Stream(torch.cuda.current_device())
+        torch.cuda.set_stream(stream)
+        start = time.time()
+        res = model.forward_0(hidden_states, full_attention_mask, rotary_pos_emb)
+        stream.synchronize()
+        print(f'PyTorch duration {time.time() - start} s')
+    return res
 
 def onnx_forward(hidden_states, full_attention_mask, rotary_pos_emb):
     import onnxruntime as ort
     import numpy as np
+    import onnx
+    from onnx import helper,shape_inference
+    
 
     model_path = "custom_model.onnx"
     session = ort.InferenceSession(model_path)
@@ -159,16 +199,16 @@ def onnx_forward(hidden_states, full_attention_mask, rotary_pos_emb):
     full_attention_mask = full_attention_mask.detach().cpu().numpy()
     rotary_pos_emb = rotary_pos_emb.detach().cpu().numpy()
 
-    # inputs = {input_names[0]: hidden_states, input_names[1]: full_attention_mask, input_names[2]: rotary_pos_emb}
+    inputs = {input_names[0]: hidden_states, input_names[1]: full_attention_mask, input_names[2]: rotary_pos_emb}
     # inputs = {input_names[0]: hidden_states}
-    inputs = {}
+    # inputs = {}
 
     outputs = session.run(output_names, inputs)
 
     output_data = outputs[0]
     return output_data
 
-def trt_forward(x: torch.Tensor, dtype: str='float32'):
+def trt_forward(x: list, dtype: str='float32'):
     # engine_file = 'model_FP16.plan'
     engine_file = 'custom_model.engine'
     with open(engine_file, 'rb') as f:
@@ -179,11 +219,15 @@ def trt_forward(x: torch.Tensor, dtype: str='float32'):
     
     dummy_input = x
     visual_features = {
-        'input': dummy_input.to(str_dtype_to_torch(dtype)),
+        'input': dummy_input[0],
+        'full_attention_mask': dummy_input[1].to(str_dtype_to_torch(dtype)),
+        'rotary_pos_emb': dummy_input[2].to(str_dtype_to_torch(dtype)),
     }
-    dummy_input = dummy_input.to(str_dtype_to_torch(dtype))
+    
     tensor_info = [
-        TensorInfo('input', str_dtype_to_trt(dtype), dummy_input.shape),
+        TensorInfo('input', str_dtype_to_trt('float32'), dummy_input[0].shape),
+        TensorInfo('full_attention_mask', str_dtype_to_trt(dtype), dummy_input[1].shape),
+        TensorInfo('rotary_pos_emb', str_dtype_to_trt(dtype), dummy_input[2].shape),
     ]
     visual_output_info = visual_encoder_session.infer_shapes(
         tensor_info)
@@ -192,13 +236,20 @@ def trt_forward(x: torch.Tensor, dtype: str='float32'):
         t.name:
         torch.empty(tuple(t.shape),
                     dtype=trt_dtype_to_torch(t.dtype),
-                    device=dummy_input.device)
+                    device=dummy_input[0].device)
         for t in visual_output_info
     }
-    stream = torch.cuda.Stream(torch.cuda.current_device())
-    torch.cuda.set_stream(stream)
-    ok = visual_encoder_session.run(visual_features, visual_outputs, stream.cuda_stream)
-    assert ok, "Runtime execution failed for vision encoder session"
+    for i in range(10):
+        stream = torch.cuda.Stream(torch.cuda.current_device())
+        torch.cuda.set_stream(stream)
+        start = time.time()
+        ok = visual_encoder_session.run(visual_features, visual_outputs, stream.cuda_stream)
+        
+        assert ok, "Runtime execution failed for vision encoder session"
+        start_2 = time.time()
+        stream.synchronize()
+        print(f'Waiting duratino {time.time() - start_2} s')
+        print(f'TRT duration {time.time() - start} s')
     image_embeds = visual_outputs['output']
     return image_embeds
 
@@ -210,10 +261,10 @@ def trt_forward_qwen(dtype: str='float32'):
     visual_encoder_session = Session.from_serialized_engine(
         engine_buffer)
     
-    hidden_states = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/hidden_states.pt')
-    rotary_pos_emb = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/rotary_pos_emb.pt')
-    full_attention_mask = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/full_attention_mask.pt')
-    window_attention_mask = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/window_attention_mask.pt')
+    hidden_states = torch.load('hidden_states.pt')
+    rotary_pos_emb = torch.load('rotary_pos_emb.pt')
+    full_attention_mask = torch.load('full_attention_mask.pt')
+    window_attention_mask = torch.load('window_attention_mask.pt')
     
     visual_features = {
         'input': hidden_states.to(str_dtype_to_torch(dtype)),
@@ -252,7 +303,7 @@ def generate_trt(dtype: str='float32'):
         1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     profile = builder.create_optimization_profile()
 
-    # onnx_file = f'/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/tmp/trt_engines/Qwen2_5-VL/fp16/1-gpu/vision/onnx/model.onnx'
+    # onnx_file = f'tmp/trt_engines/Qwen2_5-VL/fp16/1-gpu/vision/onnx/model.onnx'
     onnx_file = f'custom_model.onnx'
     engine_file = f'custom_model.engine'
     config_file = f'custom_model.config'
@@ -290,14 +341,17 @@ def generate_trt(dtype: str='float32'):
     Builder.save_config(config_wrapper, config_file)
                        
 
-model = MyModel().to('cuda')
-# torch.save(model.state_dict(), 'custom_model.pth')
+model = ModelWrapper().to('cuda')
+torch.save(model.state_dict(), 'custom_model.pth')
 model.load_state_dict(torch.load('custom_model.pth'))
 # model = model.half()
-hidden_states = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/hidden_states.pt')
-rotary_pos_emb = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/rotary_pos_emb.pt')
-full_attention_mask = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/full_attention_mask.pt')
-window_attention_mask = torch.load('/sys/fs/cgroup/zzz_tmp/TensorRT-LLM/examples/multimodal/flash_attn_trt/window_attention_mask.pt')
+torch_dtype = torch.float16
+hidden_states = torch.load('hidden_states.pt')
+rotary_pos_emb = torch.load('rotary_pos_emb.pt').to(torch_dtype)
+full_attention_mask = torch.load('full_attention_mask.pt').to(torch_dtype)
+window_attention_mask = torch.load('window_attention_mask.pt').to(torch_dtype)
+
+# full_attention_mask = window_attention_mask
 
 
 model(hidden_states, full_attention_mask, rotary_pos_emb)
@@ -309,19 +363,21 @@ torch.onnx.export(
     "custom_model.onnx",
     input_names=['input', 'full_attention_mask', 'rotary_pos_emb'],
     output_names=['output'],
-    opset_version=19,
+    opset_version=17
 )
 
+model.eval()
+
 ## export trt
-# generate_trt('float32')
+generate_trt('float16')
 
 # print('input is \n', dummy_input)
 ## run torch
 print('torch output is \n', torch_forward(model, hidden_states, full_attention_mask, rotary_pos_emb))
 
 ## run onnx
-print('onnx forward is \n', onnx_forward(hidden_states, full_attention_mask, rotary_pos_emb))
+# print('onnx forward is \n', onnx_forward(hidden_states, full_attention_mask, rotary_pos_emb))
 
 ### run trt
-# print('trt qwen output is \n', trt_forward_qwen('float16'))
-# print('trt qwen output is \n', trt_forward(dummy_input, 'float32'))
+# print('trt qwen output is \n', trt_forward_qwen('float32'))
+print('trt qwen output is \n', trt_forward([hidden_states, full_attention_mask, rotary_pos_emb], 'float16'))
