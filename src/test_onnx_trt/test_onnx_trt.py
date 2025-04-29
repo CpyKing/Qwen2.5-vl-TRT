@@ -2,8 +2,11 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import time
+
+import nvtx
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -62,17 +65,6 @@ class MyFA(torch.autograd.Function):
 _myfa = MyFA.apply
 
 class MyModel(nn.Module):
-    # def __init__(self, bias: bool = False):
-    #     super().__init__()
-    #     self.hidden_size = 768
-    #     self.intermediate_size = 1024
-    #     self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
-    #     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
-    #     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
-    #     self.act_fn = nn.SiLU()
-
-    # def forward(self, hidden_state):
-    #     return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
     
     def __init__(self, dim: int = 1280, num_heads: int = 16) -> None:
         super().__init__()
@@ -108,8 +100,49 @@ class MyModel(nn.Module):
         
         attn_output = self.proj(attn_output)
         return attn_output
+    
+    def forward_sdpa(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        if position_embeddings is None:
+            print(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            cos = emb.cos().float()
+            sin = emb.sin().float()
+        else:
+            cos, sin = position_embeddings
+        # q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
+                                        rotary_pos_emb).squeeze(0)
+        k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
+                                        rotary_pos_emb).squeeze(0)
+
+        # attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
+        # for i in range(1, len(cu_seqlens)):
+        #     attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        attention_mask = attention_mask.to(q.dtype)
+        attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
+        attn_output = attn_output.transpose(0, 1)
+        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = self.proj(attn_output)
+        return attn_output
+
     ## flash attn
-    def forward_0(
+    def forward_flash(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -159,25 +192,29 @@ class MyModel(nn.Module):
 class ModelWrapper(nn.Module):
     def __init__(self, dim: int = 1280, num_heads: int = 16):
         super().__init__()
-        self.layers = 15
+        self.layers = 20
         self.model_seq = nn.Sequential(*[MyModel(dim, num_heads) for i in range(self.layers)])
 
     def forward(self, hidden_states, full_attention_mask, rotary_pos_emb):
         for i in range(self.layers):
             hidden_states = self.model_seq[i](hidden_states, full_attention_mask, rotary_pos_emb)
         return hidden_states
-    def forward_0(self, hidden_states, full_attention_mask, rotary_pos_emb):
+    def forward_sdpa(self, hidden_states, full_attention_mask, rotary_pos_emb):
         for i in range(self.layers):
-            hidden_states = self.model_seq[i].forward_0(hidden_states, full_attention_mask, rotary_pos_emb)
+            hidden_states = self.model_seq[i].forward_sdpa(hidden_states, full_attention_mask, rotary_pos_emb)
+        return hidden_states
+    def forward_flash(self, hidden_states, full_attention_mask, rotary_pos_emb):
+        for i in range(self.layers):
+            hidden_states = self.model_seq[i].forward_flash(hidden_states, full_attention_mask, rotary_pos_emb)
         return hidden_states
 
 def torch_forward(model: nn.Module, hidden_states, full_attention_mask, rotary_pos_emb):
     for i in range(10):
-        stream = torch.cuda.Stream(torch.cuda.current_device())
-        torch.cuda.set_stream(stream)
+        # stream = torch.cuda.Stream(torch.cuda.current_device())
+        # torch.cuda.set_stream(stream)
         start = time.time()
-        res = model.forward_0(hidden_states, full_attention_mask, rotary_pos_emb)
-        stream.synchronize()
+        res = model.forward_flash(hidden_states, full_attention_mask, rotary_pos_emb)
+        # stream.synchronize()
         print(f'PyTorch duration {time.time() - start} s')
     return res
 
@@ -239,17 +276,17 @@ def trt_forward(x: list, dtype: str='float32'):
                     device=dummy_input[0].device)
         for t in visual_output_info
     }
+
     for i in range(10):
         stream = torch.cuda.Stream(torch.cuda.current_device())
         torch.cuda.set_stream(stream)
         start = time.time()
         ok = visual_encoder_session.run(visual_features, visual_outputs, stream.cuda_stream)
-        
         assert ok, "Runtime execution failed for vision encoder session"
-        start_2 = time.time()
         stream.synchronize()
-        print(f'Waiting duratino {time.time() - start_2} s')
-        print(f'TRT duration {time.time() - start} s')
+        total_trt_duration = time.time() - start
+        print(f'TRT duration {total_trt_duration} s')
+                
     image_embeds = visual_outputs['output']
     return image_embeds
 
@@ -342,6 +379,8 @@ def generate_trt(dtype: str='float32'):
                        
 
 model = ModelWrapper().to('cuda')
+# model.forward = model.forward_sdpa
+
 torch.save(model.state_dict(), 'custom_model.pth')
 model.load_state_dict(torch.load('custom_model.pth'))
 # model = model.half()
@@ -352,7 +391,6 @@ full_attention_mask = torch.load('full_attention_mask.pt').to(torch_dtype)
 window_attention_mask = torch.load('window_attention_mask.pt').to(torch_dtype)
 
 # full_attention_mask = window_attention_mask
-
 
 model(hidden_states, full_attention_mask, rotary_pos_emb)
 
